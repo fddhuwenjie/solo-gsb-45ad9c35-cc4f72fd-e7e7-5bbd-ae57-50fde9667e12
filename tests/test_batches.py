@@ -234,6 +234,73 @@ def test_replay_after_chain_advanced(client):
     assert r.json()["digest"] == d1
 
 
+def test_sequential_replays_persisted_and_reflect_cursor(client):
+    """顺序重放：列表/详情保留首次受理事实，重放计数与游标最近事件持久化。"""
+    r1 = upload(client, batch("b-1", 1))
+    original1 = r1.json()
+    d1 = original1["digest"]
+    r2 = upload(client, batch("b-2", 2, previous_digest=d1))
+    d2 = r2.json()["digest"]
+
+    # 首次重放 seq1：POST 200 replayed，原响应不被改写
+    rp1 = upload(client, batch("b-1", 1))
+    assert rp1.status_code == 200 and rp1.json()["status"] == "replayed"
+    assert {k: v for k, v in rp1.json().items() if k != "status"} == {
+        k: v for k, v in original1.items() if k != "status"
+    }
+
+    cur = client.get(f"/field-devices/{DEVICE}/cursor").json()
+    # 重放不推进链头、不新增批次
+    assert cur["last_sequence"] == 2 and cur["batch_count"] == 2
+    assert cur["head_digest"] == d2
+    # 游标最近事件改为该次重放（序号是重放批次自己的序号，不是链头）
+    assert cur["last_event_status"] == "replayed"
+    assert cur["last_event_sequence"] == 1
+    assert cur["last_event_at"] is not None
+
+    # 列表/详情仍保留 status=accepted（首次受理事实），另带 replay_count
+    lst = client.get(f"/field-devices/{DEVICE}/batches").json()["batches"]
+    by_seq = {b["sequence"]: b for b in lst}
+    assert by_seq[1]["status"] == "accepted" and by_seq[1]["replay_count"] == 1
+    assert by_seq[1]["last_replayed_at"] is not None
+    assert by_seq[2]["replay_count"] == 0 and by_seq[2]["last_replayed_at"] is None
+    detail1 = client.get(f"/field-devices/{DEVICE}/batches/1").json()
+    assert detail1["status"] == "accepted"
+    assert detail1["replay_count"] == 1
+    assert detail1["last_replayed_at"] == by_seq[1]["last_replayed_at"]
+
+    # 再次重放 seq1：计数原子累加到 2
+    rp2 = upload(client, batch("b-1", 1))
+    assert rp2.status_code == 200 and rp2.json()["status"] == "replayed"
+    detail1 = client.get(f"/field-devices/{DEVICE}/batches/1").json()
+    assert detail1["replay_count"] == 2
+
+    # 改重放链头批次 seq2：游标最近事件序号随之变为 2（链头仍不动）
+    upload(client, batch("b-2", 2, previous_digest=d1))
+    cur = client.get(f"/field-devices/{DEVICE}/cursor").json()
+    assert cur["last_event_status"] == "replayed"
+    assert cur["last_event_sequence"] == 2
+    assert cur["last_sequence"] == 2 and cur["batch_count"] == 2
+    detail2 = client.get(f"/field-devices/{DEVICE}/batches/2").json()
+    assert detail2["status"] == "accepted" and detail2["replay_count"] == 1
+
+    # 新批次受理后：链头推进，游标最近事件改回 accepted；历史重放计数保留
+    r3 = upload(client, batch("b-3", 3, previous_digest=d2))
+    assert r3.status_code == 201 and r3.json()["status"] == "accepted"
+    cur = client.get(f"/field-devices/{DEVICE}/cursor").json()
+    assert cur["last_sequence"] == 3 and cur["batch_count"] == 3
+    assert cur["head_digest"] == r3.json()["digest"]
+    assert cur["last_event_status"] == "accepted"
+    assert cur["last_event_sequence"] == 3
+    assert cur["last_event_at"] == cur["updated_at"]
+    detail1 = client.get(f"/field-devices/{DEVICE}/batches/1").json()
+    assert detail1["replay_count"] == 2
+    detail2 = client.get(f"/field-devices/{DEVICE}/batches/2").json()
+    assert detail2["replay_count"] == 1
+    detail3 = client.get(f"/field-devices/{DEVICE}/batches/3").json()
+    assert detail3["replay_count"] == 0 and detail3["last_replayed_at"] is None
+
+
 # ---------------- 请求校验 ----------------
 
 
@@ -296,22 +363,34 @@ def test_exactly_100_observations_accepted(client):
 
 
 def test_cursor_and_batch_queries(client):
-    # 未上传过的设备：空链游标
+    # 未上传过的设备：空链游标（无最近事件）
     cur = client.get("/field-devices/dev-empty/cursor").json()
     assert cur["last_sequence"] == 0 and cur["head_digest"] == ""
     assert cur["next_sequence"] == 1 and cur["expected_previous_digest"] == ""
     assert cur["batch_count"] == 0 and cur["updated_at"] is None
+    assert cur["last_event_status"] is None
+    assert cur["last_event_sequence"] == 0
+    assert cur["last_event_at"] is None
     assert client.get("/field-devices/dev-empty/batches").json()["count"] == 0
 
     d = upload(client, batch("b-1", 1)).json()["digest"]
     d = upload(client, batch("b-2", 2, previous_digest=d)).json()["digest"]
     upload(client, batch("b-3", 3, previous_digest=d))
 
-    # 列表：状态字段区分 accepted；next_cursor 为 None 表示无更多
+    # 新批次受理后：游标最近事件为最新批次的 accepted
+    cur = client.get(f"/field-devices/{DEVICE}/cursor").json()
+    assert cur["last_event_status"] == "accepted"
+    assert cur["last_event_sequence"] == 3
+    assert cur["last_event_at"] == cur["updated_at"]
+
+    # 列表：状态保留首次受理事实 accepted，另带重放计数（无重放时为零）；
+    # next_cursor 为 None 表示无更多
     lst = client.get(f"/field-devices/{DEVICE}/batches").json()
     assert lst["count"] == 3 and lst["next_cursor"] is None
     assert [b["sequence"] for b in lst["batches"]] == [1, 2, 3]
     assert all(b["status"] == "accepted" for b in lst["batches"])
+    assert all(b["replay_count"] == 0 for b in lst["batches"])
+    assert all(b["last_replayed_at"] is None for b in lst["batches"])
     assert lst["batches"][0]["batch_id"] == "b-1"
 
     # 游标分页：after_sequence 续查
@@ -327,6 +406,7 @@ def test_cursor_and_batch_queries(client):
     # 详情：观测时间戳与 /judge 四项阈值均已保存，未做判定
     detail = client.get(f"/field-devices/{DEVICE}/batches/2").json()
     assert detail["status"] == "accepted"
+    assert detail["replay_count"] == 0 and detail["last_replayed_at"] is None
     assert detail["observations"] == obs(3)
     assert detail["thresholds"] == THRESHOLDS
     assert detail["observation_count"] == 3
@@ -390,3 +470,163 @@ def test_concurrent_identical_replay(client):
     assert results.count((200, "replayed")) == len(threads) - 1
     cur = client.get(f"/field-devices/{DEVICE}/cursor").json()
     assert cur["last_sequence"] == 1 and cur["batch_count"] == 1
+
+
+def test_concurrent_replays_lose_no_count(client):
+    """并发重放已受理批次：每次重放都原子累加，不得丢计数，也不得新增批次。"""
+    body = batch("b-1", 1)
+    r1 = upload(client, body)
+    assert r1.status_code == 201
+
+    n = 12
+    barrier = threading.Barrier(n)
+    results = []
+    lock = threading.Lock()
+
+    def submit():
+        barrier.wait()  # 尽量让所有请求同时进入
+        r = upload(client, body)
+        with lock:
+            results.append(r.status_code)
+
+    threads = [threading.Thread(target=submit) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count(200) == n
+
+    detail = client.get(f"/field-devices/{DEVICE}/batches/1").json()
+    assert detail["status"] == "accepted"  # 首次受理事实不变
+    assert detail["replay_count"] == n     # 每次重放都计数，无丢失
+    assert detail["last_replayed_at"] is not None
+
+    # 不新增批次、不推进链头；游标最近事件为最后一次重放
+    lst = client.get(f"/field-devices/{DEVICE}/batches").json()
+    assert lst["count"] == 1 and lst["batches"][0]["replay_count"] == n
+    cur = client.get(f"/field-devices/{DEVICE}/cursor").json()
+    assert cur["last_sequence"] == 1 and cur["batch_count"] == 1
+    assert cur["head_digest"] == r1.json()["digest"]
+    assert cur["last_event_status"] == "replayed"
+    assert cur["last_event_sequence"] == 1
+
+
+def test_legacy_device_db_upgrade_zero_replay_count(tmp_path):
+    """旧库升级：补重放列（旧记录计数为零）与游标最近事件，升级后可正常重放。"""
+    import json as _json
+    import sqlite3
+
+    db = tmp_path / "legacy-devices.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE device_chains (
+            device_id     TEXT PRIMARY KEY,
+            last_sequence INTEGER NOT NULL,
+            head_digest   TEXT NOT NULL,
+            batch_count   INTEGER NOT NULL,
+            updated_at    REAL NOT NULL
+        );
+        CREATE TABLE device_batches (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id         TEXT NOT NULL,
+            sequence          INTEGER NOT NULL,
+            batch_id          TEXT NOT NULL,
+            previous_digest   TEXT NOT NULL,
+            digest            TEXT NOT NULL,
+            observation_count INTEGER NOT NULL,
+            thresholds        TEXT NOT NULL,
+            observations      TEXT NOT NULL,
+            response          TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'accepted',
+            created_at        REAL NOT NULL,
+            UNIQUE (device_id, sequence),
+            UNIQUE (device_id, batch_id)
+        );
+        """
+    )
+    # 按当前摘要规则造一条旧库批次（seq1，已受理）
+    body1 = batch("b-1", 1)
+    d1 = expected_digest(DEVICE, body1)
+    ts1 = 1_700_000_000.0
+    observations1 = body1["observations"]
+    thresholds1 = {k: body1[k] for k in ("tolerance", "max_drift", "max_missed", "max_false")}
+    response1 = {
+        "status": "accepted",
+        "device_id": DEVICE,
+        "batch_id": "b-1",
+        "sequence": 1,
+        "digest": d1,
+        "previous_digest": "",
+        "observation_count": len(observations1),
+        "received_at": "2023-11-14T22:13:20+00:00",
+        "chain": {
+            "head_sequence": 1,
+            "head_digest": d1,
+            "next_sequence": 2,
+            "expected_previous_digest": d1,
+        },
+    }
+    conn.execute(
+        "INSERT INTO device_batches "
+        "(device_id, sequence, batch_id, previous_digest, digest, observation_count, "
+        "thresholds, observations, response, status, created_at) "
+        "VALUES (?, 1, 'b-1', '', ?, ?, ?, ?, ?, 'accepted', ?)",
+        (
+            DEVICE, d1, len(observations1),
+            _json.dumps(thresholds1), _json.dumps(observations1),
+            _json.dumps(response1), ts1,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO device_chains "
+        "(device_id, last_sequence, head_digest, batch_count, updated_at) "
+        "VALUES (?, 1, ?, 1, ?)",
+        (DEVICE, d1, ts1),
+    )
+    conn.commit()
+    conn.close()
+
+    app = create_app(db_path=str(db))
+    with TestClient(app) as c:
+        # 旧记录重放次数为零、无最近重放时刻；三个查询接口字段含义一致
+        cur = c.get(f"/field-devices/{DEVICE}/cursor").json()
+        assert cur["last_sequence"] == 1 and cur["batch_count"] == 1
+        assert cur["head_digest"] == d1
+        # 迁移回填：旧链最近事件为链头批次的受理事件
+        assert cur["last_event_status"] == "accepted"
+        assert cur["last_event_sequence"] == 1
+        assert cur["last_event_at"] is not None
+
+        item = c.get(f"/field-devices/{DEVICE}/batches").json()["batches"][0]
+        assert item["status"] == "accepted"
+        assert item["replay_count"] == 0
+        assert item["last_replayed_at"] is None
+
+        detail = c.get(f"/field-devices/{DEVICE}/batches/1").json()
+        assert detail["status"] == "accepted"
+        assert detail["replay_count"] == 0
+        assert detail["last_replayed_at"] is None
+        assert detail["observations"] == observations1
+        assert detail["thresholds"] == thresholds1
+
+        # 升级后重放走新逻辑：200 replayed，计数变为 1，游标最近事件更新
+        r = upload(c, body1)
+        assert r.status_code == 200 and r.json()["status"] == "replayed"
+        assert r.json()["digest"] == d1
+        detail = c.get(f"/field-devices/{DEVICE}/batches/1").json()
+        assert detail["replay_count"] == 1
+        assert detail["last_replayed_at"] is not None
+        cur = c.get(f"/field-devices/{DEVICE}/cursor").json()
+        assert cur["last_event_status"] == "replayed"
+        assert cur["last_event_sequence"] == 1
+        assert cur["last_sequence"] == 1 and cur["batch_count"] == 1
+
+        # 旧链仍可继续受理新批次，游标最近事件回到 accepted
+        r2 = upload(c, batch("b-2", 2, previous_digest=d1))
+        assert r2.status_code == 201
+        cur = c.get(f"/field-devices/{DEVICE}/cursor").json()
+        assert cur["last_sequence"] == 2 and cur["batch_count"] == 2
+        assert cur["last_event_status"] == "accepted"
+        assert cur["last_event_sequence"] == 2

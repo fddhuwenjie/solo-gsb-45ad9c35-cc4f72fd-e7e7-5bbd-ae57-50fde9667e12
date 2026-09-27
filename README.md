@@ -20,8 +20,9 @@
 `previous_digest` 和 1～100 条按 `(captured_at, local_id)` 递增的观测；服务端
 只保存观测时间戳与 `/judge` 四项阈值（不判定），并对排除摘要字段的规范化载荷
 计算 SHA-256 作为批次摘要。校验、追加记录、更新设备链头在**单个 SQLite 事务**
-内完成：相同载荷重放返回原结果（`status=replayed`），载荷变化或链头过期返回
-409 及期望值，并发提交不会形成分叉。
+内完成：相同载荷重放在幂等事务内原子累加 `replay_count` 并更新游标最近事件
+（不新增批次、不推进链头、不改写首次受理响应），返回原结果（`status=replayed`），
+载荷变化或链头过期返回 409 及期望值，并发提交与并发重放都不会形成分叉或丢计数。
 
 ## 快速开始
 
@@ -70,9 +71,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/judgments` | 查询判定记录（`limit`/`offset` 分页，按时间倒序） |
 | `GET` | `/judgments/{id}` | 查询单条判定记录详情（含完整请求与响应） |
 | `POST` | `/field-devices/{device_id}/batches` | 上传设备观测批次：链式追加、只保存不判定；重放返回原结果，冲突 409 |
-| `GET` | `/field-devices/{device_id}/cursor` | 查询设备批次链游标（链头摘要与下一批期望值） |
-| `GET` | `/field-devices/{device_id}/batches` | 按 `after_sequence` 游标分页列出设备批次（含受理状态） |
-| `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（观测时间戳与 `/judge` 四项阈值） |
+| `GET` | `/field-devices/{device_id}/cursor` | 查询设备批次链游标（链头摘要、下一批期望值与最近事件状态/序号/时刻） |
+| `GET` | `/field-devices/{device_id}/batches` | 按 `after_sequence` 游标分页列出设备批次（首次受理状态 + 重放计数） |
+| `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（观测时间戳、`/judge` 四项阈值与重放计数） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -146,8 +147,11 @@ curl -s -X POST http://localhost:8000/library/versions/<新草稿号>/activate
 
 **首次迁移**：服务启动时若发现旧版平铺 `aids` 表，会在单个事务内将其整体
 转为初始激活版本（`version_id=1`，`source="migration"`）并补充判定记录的
-`library_version` 列；全新部署则无初始版本，首次 `/library/import` 即创建
-版本 1。
+`library_version` 列；同时为旧版设备批次表补充 `replay_count` /
+`last_replayed_at` 列（既有批次重放次数为零、`last_replayed_at` 为空）、
+为设备链游标表补充 `last_event_status` / `last_event_sequence` /
+`last_event_at` 列（回填为链头批次的受理事件）。全新部署则无初始版本，首次
+`/library/import` 即创建版本 1。
 
 ### 3. 判定观测序列
 
@@ -309,9 +313,35 @@ curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
 不会形成分叉（同一序号只会有一个批次被接受，其余收到 409）。
 
 **幂等重放**：以相同载荷重发同一 `batch_id`（或同一序号）时，服务端返回
-**原结果**，仅 `status` 标记为 `replayed`（HTTP 200），链头与记录数不变；
-新接受的批次为 `status=accepted`（HTTP 201）。上传响应与批次查询（列表/
-详情）响应均带 `status` 字段，区分 `accepted` 与 `replayed`，重试安全。
+**原结果**，仅 `status` 标记为 `replayed`（HTTP 200）；新接受的批次为
+`status=accepted`（HTTP 201）。重放在**幂等事务**内完成两件持久化工作：
+原子累加该批次的 `replay_count`、刷新其 `last_replayed_at`，并把设备游标的
+最近事件改为本次重放；同时保证**三不**——不新增批次、不推进链头
+（`last_sequence`/`head_digest`/`batch_count` 不变）、不改写首次受理响应。
+并发重放由写锁 + `BEGIN IMMEDIATE` 串行化，计数用
+`replay_count = replay_count + 1` 原子累加，不会丢计数。
+
+批次的**列表与详情**始终保留 `status=accepted` 作为首次受理事实（不因重放而
+变成 `replayed`），并额外返回含义相同的两个字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 首次受理事实，恒为 `accepted`（重放只在当次上传响应中标记为 `replayed`） |
+| `replay_count` | 相同载荷的累计重放次数；从未重放为 `0`（旧库迁移的既有批次也为 0） |
+| `last_replayed_at` | 最近一次重放时刻（UTC ISO-8601）；从未重放为 `null` |
+
+**游标**在链头信息之外另返回最近一次事件（受理或重放）的三个字段；新批次
+受理后最近事件为该批次的 `accepted`，重放后改为被重放批次的 `replayed`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `last_event_status` | 最近事件类型：`accepted` / `replayed`；空链设备为 `null` |
+| `last_event_sequence` | 最近事件所属批次序号（重放历史批次时为该批次序号，而非链头序号）；空链为 `0` |
+| `last_event_at` | 最近事件时刻（UTC ISO-8601）；空链为 `null` |
+
+注意 `updated_at` 只在链头被新批次推进时变化，重放不更新它；要判断「最近
+一次设备交互」请使用 `last_event_*`。上传响应（`accepted`/`replayed`）与
+三个查询接口的字段分工明确、含义一致，重试安全。
 
 **断网续传**：设备离线期间在本地缓存批次；恢复联网后先查游标，从
 `next_sequence` 与 `expected_previous_digest` 续传，已送达的批次按幂等
@@ -321,7 +351,9 @@ curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
 # 查询服务端链头：下一批该用哪个 sequence 与 previous_digest
 curl -s http://localhost:8000/field-devices/dev-01/cursor
 # → {"last_sequence": 2, "head_digest": "5e7aa3…", "next_sequence": 3,
-#    "expected_previous_digest": "5e7aa3…", "batch_count": 2, …}
+#    "expected_previous_digest": "5e7aa3…", "batch_count": 2,
+#    "last_event_status": "accepted", "last_event_sequence": 2,
+#    "last_event_at": "…", …}
 
 # 断网期间未确认的批次原样重发：若服务端已接受，返回原结果且 status=replayed
 curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
@@ -356,10 +388,11 @@ curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
 
 ```bash
 # 分页列出批次（after_sequence 为上一页响应的 next_cursor）
+# 每条批次带 status（首次受理事实，恒为 accepted）、replay_count、last_replayed_at
 curl -s "http://localhost:8000/field-devices/dev-01/batches?limit=2"
 curl -s "http://localhost:8000/field-devices/dev-01/batches?after_sequence=2&limit=2"
 
-# 单条批次详情：观测时间戳与 /judge 四项阈值
+# 单条批次详情：观测时间戳、/judge 四项阈值与重放计数
 curl -s http://localhost:8000/field-devices/dev-01/batches/2
 ```
 
@@ -412,7 +445,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链共 52 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链共 55 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
