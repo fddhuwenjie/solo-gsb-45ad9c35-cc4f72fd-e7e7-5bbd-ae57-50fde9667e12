@@ -26,9 +26,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "服务端特征库以不可变版本发布：草稿提交后可查询增删改差异，"
             "激活时单事务校验 base_version 仍是当前版本，冲突返回 409。"
             "现场设备按链式批次上传观测：批次摘要以前一批摘要链接，"
-            "单事务校验并追加，相同载荷重放返回原结果，冲突返回 409 及期望值。"
+            "单事务校验并追加，相同载荷重放返回原结果并持久化累计重放次数"
+            "（列表/详情带 replay_count 与 last_replayed_at，游标带最近事件），"
+            "冲突返回 409 及期望值。"
         ),
-        version="1.3.0",
+        version="1.4.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -321,8 +323,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "批次 sequence 从 1 递增，previous_digest 引用当前链头（首批为空）；"
             "服务端对排除摘要字段的规范化载荷计算 SHA-256 作为批次摘要。"
             "校验、追加记录、更新链头在单个 SQLite 事务内完成：相同载荷重放"
-            "返回原结果（status=replayed，HTTP 200），载荷变化或链头过期返回"
-            " 409 及期望值（expected_sequence / expected_previous_digest）。"
+            "返回原结果（status=replayed，HTTP 200），并在同一幂等事务内原子"
+            "累加重放计数、更新游标最近事件（不新增批次、不推进链头、不改写"
+            "首次响应）；载荷变化或链头过期返回 409 及期望值"
+            "（expected_sequence / expected_previous_digest）。"
         ),
     )
     def upload_device_batch(
@@ -340,14 +344,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get(
         "/field-devices/{device_id}/cursor",
-        summary="查询设备批次链游标（链头与下一批期望值）",
+        summary="查询设备批次链游标（链头、下一批期望值与最近事件）",
     )
     def get_device_cursor(device_id: str = Path(min_length=1, max_length=128)) -> dict:
         return app.state.db.get_device_cursor(device_id)
 
     @app.get(
         "/field-devices/{device_id}/batches",
-        summary="按游标分页查询设备批次（含受理状态）",
+        summary="按游标分页查询设备批次（受理状态与重放计数）",
     )
     def list_device_batches(
         device_id: str = Path(min_length=1, max_length=128),
@@ -360,7 +364,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get(
         "/field-devices/{device_id}/batches/{sequence}",
-        summary="查询单条批次详情（观测时间戳与判定阈值）",
+        summary="查询单条批次详情（观测时间戳、判定阈值与重放计数）",
     )
     def get_device_batch(
         device_id: str = Path(min_length=1, max_length=128),

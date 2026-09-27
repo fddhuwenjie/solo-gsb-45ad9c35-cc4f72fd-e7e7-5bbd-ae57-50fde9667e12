@@ -10,14 +10,21 @@
 
 - ``device_batches``：每个设备按 sequence 递增的批次记录（含观测时间戳、
   /judge 四项阈值、批次摘要与受理响应），(device_id, sequence) 与
-  (device_id, batch_id) 均唯一；
-- ``device_chains``：每个设备的链头游标（last_sequence、head_digest）。
+  (device_id, batch_id) 均唯一；``status`` 保留首次受理事实（accepted），
+  重放以 ``replay_count`` / ``last_replayed_at`` 持久化累计；
+- ``device_chains``：每个设备的链头游标（last_sequence、head_digest）与
+  最近事件（last_event_status/last_event_sequence/last_event_at，
+  受理或重放都会更新，链头字段仅受理时推进）。
 
-批次提交在单个事务内完成「幂等/链头校验 → 追加记录 → 更新链头」；写锁 +
-BEGIN IMMEDIATE + 唯一约束保证并发提交串行化，不会形成分叉。
+批次提交在单个事务内完成「幂等/链头校验 → 追加记录 → 更新链头」；重放在同一
+幂等事务内原子累加重放计数并更新最近事件，不新增批次、不推进链头、不改写首次
+受理响应。写锁 + BEGIN IMMEDIATE + 唯一约束保证并发提交串行化，不会形成分叉，
+并发重放也不会丢计数。
 
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
-并给 ``judgments`` 表补充 ``library_version`` 列；迁移在单个事务内完成。
+并给 ``judgments`` 表补充 ``library_version`` 列、给批次链两表补充重放计数与
+最近事件列（旧记录重放次数为零，既有链的最近事件回填为链头批次的受理）；迁移
+在单个事务内完成。
 """
 from __future__ import annotations
 
@@ -65,11 +72,14 @@ CREATE TABLE IF NOT EXISTS judgments (
     response        TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS device_chains (
-    device_id     TEXT PRIMARY KEY,
-    last_sequence INTEGER NOT NULL,
-    head_digest   TEXT NOT NULL,
-    batch_count   INTEGER NOT NULL,
-    updated_at    REAL NOT NULL
+    device_id           TEXT PRIMARY KEY,
+    last_sequence       INTEGER NOT NULL,
+    head_digest         TEXT NOT NULL,
+    batch_count         INTEGER NOT NULL,
+    updated_at          REAL NOT NULL,
+    last_event_status   TEXT,
+    last_event_sequence INTEGER,
+    last_event_at       REAL
 );
 CREATE TABLE IF NOT EXISTS device_batches (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +93,8 @@ CREATE TABLE IF NOT EXISTS device_batches (
     observations      TEXT NOT NULL,
     response          TEXT NOT NULL,
     status            TEXT NOT NULL DEFAULT 'accepted',
+    replay_count      INTEGER NOT NULL DEFAULT 0,
+    last_replayed_at  REAL,
     created_at        REAL NOT NULL,
     UNIQUE (device_id, sequence),
     UNIQUE (device_id, batch_id)
@@ -205,6 +217,31 @@ class Database:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(judgments)")}
         if "library_version" not in cols:
             conn.execute("ALTER TABLE judgments ADD COLUMN library_version INTEGER")
+        # 批次链重放状态持久化：旧库补列，旧记录重放次数为零、最近事件回填为受理
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(device_batches)")}
+        if "replay_count" not in cols:
+            conn.execute(
+                "ALTER TABLE device_batches "
+                "ADD COLUMN replay_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_replayed_at" not in cols:
+            conn.execute(
+                "ALTER TABLE device_batches ADD COLUMN last_replayed_at REAL"
+            )
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(device_chains)")}
+        if "last_event_status" not in cols:
+            conn.execute(
+                "ALTER TABLE device_chains ADD COLUMN last_event_status TEXT"
+            )
+            conn.execute(
+                "ALTER TABLE device_chains ADD COLUMN last_event_sequence INTEGER"
+            )
+            conn.execute("ALTER TABLE device_chains ADD COLUMN last_event_at REAL")
+            # 既有链的最近事件即链头批次的首次受理
+            conn.execute(
+                "UPDATE device_chains SET last_event_status = 'accepted', "
+                "last_event_sequence = last_sequence, last_event_at = updated_at"
+            )
 
     # ---------------- 特征库版本 ----------------
 
@@ -464,8 +501,11 @@ class Database:
         """单事务提交批次：幂等/链头校验 → 追加记录 → 更新设备链头。
 
         返回 ``(响应体, 是否新接受)``。相同载荷重放（摘要一致）返回原结果并
-        标记 ``replayed``；载荷变化或链头过期抛 :class:`BatchConflict`。
-        写锁 + BEGIN IMMEDIATE 串行化并发提交，唯一约束兜底，不会形成分叉。
+        标记 ``replayed``，且在同一幂等事务内原子累加 ``replay_count``、
+        更新 ``last_replayed_at`` 与链游标的最近事件——不新增批次、不推进
+        链头、不改写首次受理响应；载荷变化或链头过期抛 :class:`BatchConflict`。
+        写锁 + BEGIN IMMEDIATE 串行化并发提交，唯一约束兜底，不会形成分叉，
+        并发重放也不会丢计数。
         """
         digest = compute_digest(canonical_payload(device_id, req))
         prev = req.previous_digest or ""
@@ -503,6 +543,19 @@ class Database:
                     and row_bid["id"] == row_seq["id"]
                     and row_bid["digest"] == digest
                 ):
+                    # 幂等重放：同事务原子累加重放计数并更新链游标最近事件；
+                    # 不新增批次、不推进链头、不改写首次受理的响应
+                    conn.execute(
+                        "UPDATE device_batches SET replay_count = replay_count + 1, "
+                        "last_replayed_at = ? WHERE id = ?",
+                        (now, row_bid["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE device_chains SET last_event_status = 'replayed', "
+                        "last_event_sequence = ?, last_event_at = ? "
+                        "WHERE device_id = ?",
+                        (row_bid["sequence"], now, device_id),
+                    )
                     body = json.loads(row_bid["response"])
                     body["status"] = "replayed"
                     return body, False
@@ -572,19 +625,28 @@ class Database:
             )
             conn.execute(
                 "INSERT INTO device_chains "
-                "(device_id, last_sequence, head_digest, batch_count, updated_at) "
-                "VALUES (?, ?, ?, 1, ?) "
+                "(device_id, last_sequence, head_digest, batch_count, updated_at, "
+                "last_event_status, last_event_sequence, last_event_at) "
+                "VALUES (?, ?, ?, 1, ?, 'accepted', ?, ?) "
                 "ON CONFLICT(device_id) DO UPDATE SET "
                 "last_sequence = excluded.last_sequence, "
                 "head_digest = excluded.head_digest, "
                 "batch_count = device_chains.batch_count + 1, "
-                "updated_at = excluded.updated_at",
-                (device_id, req.sequence, digest, now),
+                "updated_at = excluded.updated_at, "
+                "last_event_status = excluded.last_event_status, "
+                "last_event_sequence = excluded.last_event_sequence, "
+                "last_event_at = excluded.last_event_at",
+                (device_id, req.sequence, digest, now, req.sequence, now),
             )
         return body, True
 
     def get_device_cursor(self, device_id: str) -> dict:
-        """设备批次链游标：链头位置与下一批期望值（未上传过的设备返回空链）。"""
+        """设备批次链游标：链头位置、下一批期望值与最近事件（受理/重放）。
+
+        未上传过的设备返回空链。``updated_at`` 是链头最近推进（受理）时刻；
+        ``last_event_*`` 描述最近一次提交事件——新批次受理后为 ``accepted``，
+        幂等重放后为 ``replayed``（链头字段不变）。
+        """
         with closing(self._connect()) as conn:
             chain = conn.execute(
                 "SELECT * FROM device_chains WHERE device_id = ?", (device_id,)
@@ -598,6 +660,9 @@ class Database:
                 "next_sequence": 1,
                 "expected_previous_digest": "",
                 "updated_at": None,
+                "last_event_status": None,
+                "last_event_sequence": None,
+                "last_event_at": None,
             }
         return {
             "device_id": device_id,
@@ -607,16 +672,28 @@ class Database:
             "next_sequence": chain["last_sequence"] + 1,
             "expected_previous_digest": chain["head_digest"],
             "updated_at": _iso(chain["updated_at"]),
+            "last_event_status": chain["last_event_status"],
+            "last_event_sequence": chain["last_event_sequence"],
+            "last_event_at": (
+                _iso(chain["last_event_at"])
+                if chain["last_event_at"] is not None
+                else None
+            ),
         }
 
     def list_device_batches(
         self, device_id: str, *, after_sequence: int = 0, limit: int = 50
     ) -> dict:
-        """按 sequence 游标分页列出设备批次（升序）。"""
+        """按 sequence 游标分页列出设备批次（升序）。
+
+        ``status`` 保留首次受理事实（accepted）；重放以 ``replay_count`` /
+        ``last_replayed_at`` 反映，与批次详情字段含义一致。
+        """
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT sequence, batch_id, previous_digest, digest, "
-                "observation_count, status, created_at FROM device_batches "
+                "observation_count, status, replay_count, last_replayed_at, "
+                "created_at FROM device_batches "
                 "WHERE device_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
                 (device_id, after_sequence, limit + 1),
             ).fetchall()
@@ -630,6 +707,12 @@ class Database:
                 "digest": r["digest"],
                 "observation_count": r["observation_count"],
                 "status": r["status"],
+                "replay_count": r["replay_count"],
+                "last_replayed_at": (
+                    _iso(r["last_replayed_at"])
+                    if r["last_replayed_at"] is not None
+                    else None
+                ),
                 "created_at": _iso(r["created_at"]),
             }
             for r in rows
@@ -642,7 +725,11 @@ class Database:
         }
 
     def get_device_batch(self, device_id: str, sequence: int) -> dict | None:
-        """单条批次详情：观测时间戳、/judge 四项阈值、摘要与受理状态。"""
+        """单条批次详情：观测时间戳、/judge 四项阈值、摘要与受理状态。
+
+        ``status`` 保留首次受理事实（accepted）；重放以 ``replay_count`` /
+        ``last_replayed_at`` 反映，与批次列表字段含义一致。
+        """
         with closing(self._connect()) as conn:
             r = conn.execute(
                 "SELECT * FROM device_batches WHERE device_id = ? AND sequence = ?",
@@ -660,5 +747,11 @@ class Database:
             "observation_count": r["observation_count"],
             "observations": json.loads(r["observations"]),
             "thresholds": json.loads(r["thresholds"]),
+            "replay_count": r["replay_count"],
+            "last_replayed_at": (
+                _iso(r["last_replayed_at"])
+                if r["last_replayed_at"] is not None
+                else None
+            ),
             "created_at": _iso(r["created_at"]),
         }
